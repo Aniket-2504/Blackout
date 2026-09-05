@@ -1,11 +1,10 @@
 buildscript {
     ext {
-        buildToolsVersion = "37.0.0"
+        buildToolsVersion = "35.0.0"
         minSdkVersion = 24
-        compileSdkVersion = 37
-        targetSdkVersion = 36
-        ndkVersion = "27.1.12297006"
-        kotlinVersion = "2.2.0"
+        compileSdkVersion = 35
+        targetSdkVersion = 34
+        ndkVersion = "28.2.13676358"
     }
     repositories {
         google()
@@ -19,3 +18,19 @@ buildscript {
 }
 
 apply plugin: "com.facebook.react.rootproject"
+
+allprojects {
+    repositories {
+        maven {
+            // All of React Native (JS, Obj-C sources, Android binaries) is installed from npm
+            url("$rootDir/../node_modules/react-native/android")
+        }
+        maven {
+            // Android JSC is installed from npm
+            url("$rootDir/../node_modules/jsc-android/dist")
+        }
+        google()
+        mavenCentral()
+        maven { url 'https://www.jitpack.io' }
+    }
+}
