@@ -1,37 +1,15 @@
-/**
- * Sample React Native App
- * https://github.com/facebook/react-native
- *
- * @format
- */
+import React from 'react';
+import { StyleSheet, Text, View, StatusBar } from 'react-native';
 
-import { NewAppScreen } from '@react-native/new-app-screen';
-import { StatusBar, StyleSheet, useColorScheme, View } from 'react-native';
-import {
-  SafeAreaProvider,
-  useSafeAreaInsets,
-} from 'react-native-safe-area-context';
-
-function App() {
-  const isDarkMode = useColorScheme() === 'dark';
-
-  return (
-    <SafeAreaProvider>
-      <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
-      <AppContent />
-    </SafeAreaProvider>
-  );
-}
-
-function AppContent() {
-  const safeAreaInsets = useSafeAreaInsets();
-
+export default function App() {
   return (
     <View style={styles.container}>
-      <NewAppScreen
-        templateFileName="App.tsx"
-        safeAreaInsets={safeAreaInsets}
-      />
+      <StatusBar barStyle="light-content"  />
+      <Text style={styles.title}>BLACKOUT</Text>
+      <Text style={styles.subtitle}>Physical Privacy Reimagined</Text>
+      <View style={styles.badge}>
+        <Text style={styles.badgeText}>🟢 SYSTEM READY</Text>
+      </View>
     </View>
   );
 }
@@ -39,7 +17,34 @@ function AppContent() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    backgroundColor: '#0B0F19',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  title: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+    letterSpacing: 3,
+    marginBottom: 8,
+  },
+  subtitle: {
+    fontSize: 14,
+    color: '#9CA3AF',
+    marginBottom: 30,
+  },
+  badge: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: '#1E293B',
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#10B981',
+  },
+  badgeText: {
+    color: '#10B981',
+    fontWeight: '600',
+    fontSize: 14,
   },
 });
-
-export default App;
