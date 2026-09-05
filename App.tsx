@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+// App.tsx
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   StyleSheet,
   Text,
@@ -7,208 +8,685 @@ import {
   SafeAreaView,
   PermissionsAndroid,
   Platform,
+  TouchableOpacity,
+  AppState,
+  AppStateStatus,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
+import { launchCamera } from 'react-native-image-picker';
+
+const SafeWebView = WebView as any;
+type CameraMode = 'environment' | 'user';
+
+// FIX: the HTML/JS engine is now a pure static string with NO React state baked
+// into it. It never changes after first render, so `source.html` never changes,
+// so the WebView never reloads. All camera-mode changes go through
+// injectJavaScript() calls into the already-running page — exactly once, on
+// purpose, instead of "once from the reload + once from our own injection".
+//
+// NOTE: everything the page needs (IdentityEngine, LlmEngine) is INLINED
+// below as plain <script> blocks. There is no real file server behind this
+// WebView (it's loaded via `source={{ html: ... }}`), so a `src="./x.js"`
+// relative path can never resolve — that was silently breaking
+// window.IdentityEngine and window.LlmEngine in the previous version.
+const PIPELINE_ENGINE_HTML = `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body, html { width: 100%; height: 100%; background: #000; overflow: hidden; }
+      #stage { position: relative; width: 100%; height: 100%; }
+      video { width: 100%; height: 100%; object-fit: cover; display: block; }
+      canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js" crossorigin="anonymous"></script>
+  </head>
+  <body>
+    <div id="stage">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="trackerCanvas"></canvas>
+    </div>
+
+    <script>
+      // ============================================================
+      // IdentityEngine — Tier-1 identity verifier (face-api.js / TF.js)
+      // Inlined here because a relative src="./identity-engine.js" has
+      // no file to resolve against inside an in inline 'html:' WebView.
+      // ============================================================
+      window.IdentityEngine = (function () {
+        // FIX: switched off the jsdelivr GitHub-proxy mirror -- likely
+        // point of failure on congested venue wifi. This is the
+        // author's own GitHub Pages host, served as static files.
+        const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
+        const MATCH_THRESHOLD = 0.55;
+        const IDENTITY_INTERVAL_MS = 400;
+        const DETECTOR_OPTS = { inputSize: 160, scoreThreshold: 0.5 };
+        const MODEL_LOAD_TIMEOUT_MS = 20000; // FIX: never hang silently again
+
+        let modelsReady = false;
+        let operatorDescriptor = null;
+
+        function withTimeout(promise, ms) {
+          return Promise.race([
+            promise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Model load timed out')), ms)),
+          ]);
+        }
+
+        async function loadModels() {
+          try {
+            await withTimeout(Promise.all([
+              faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+              faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+              faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+            ]), MODEL_LOAD_TIMEOUT_MS);
+            modelsReady = true;
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'IDENTITY_MODELS_READY' }));
+          } catch (err) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'IDENTITY_MODELS_FAILED', error: String(err) }));
+          }
+        }
+
+        async function enroll(base64Image) {
+          if (!modelsReady) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'ENROLL_FAILED', error: 'Models not loaded yet' }));
+            return;
+          }
+          try {
+            const img = new Image();
+            img.src = base64Image;
+            await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; });
+
+            const result = await faceapi
+              .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions(DETECTOR_OPTS))
+              .withFaceLandmarks()
+              .withFaceDescriptor();
+
+            if (!result) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'ENROLL_FAILED', error: 'No face found in selfie' }));
+              return;
+            }
+            operatorDescriptor = result.descriptor;
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'ENROLL_DONE' }));
+          } catch (err) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'ENROLL_FAILED', error: String(err) }));
+          }
+        }
+
+        function clearEnrollment() { operatorDescriptor = null; }
+        function hasOperator() { return operatorDescriptor !== null; }
+
+        async function identifyCrop(cropCanvas) {
+          if (!modelsReady || !operatorDescriptor) return null;
+          try {
+            const result = await faceapi
+              .detectSingleFace(cropCanvas, new faceapi.TinyFaceDetectorOptions(DETECTOR_OPTS))
+              .withFaceLandmarks()
+              .withFaceDescriptor();
+            if (!result) return null;
+            const distance = faceapi.euclideanDistance(operatorDescriptor, result.descriptor);
+            return distance < MATCH_THRESHOLD ? 'operator' : 'bystander';
+          } catch (err) {
+            return null;
+          }
+        }
+
+        return { loadModels, enroll, clearEnrollment, hasOperator, identifyCrop, isModelsReady: () => modelsReady, IDENTITY_INTERVAL_MS };
+      })();
+
+      window.enrollOperatorFace = function (base64Image) { window.IdentityEngine.enroll(base64Image); };
+      window.clearOperatorEnrollment = function () { window.IdentityEngine.clearEnrollment(); };
+      window.retryIdentityModelLoad = function () { window.IdentityEngine.loadModels(); };
+
+      // ============================================================
+      // LlmEngine — Tier-2 semantic verifier (Gemma 2B via MediaPipe
+      // tasks-genai). Fires ONLY on SAFE -> LOCKDOWN transitions, never
+      // per-frame. Purely corroborating/logging -- never gates the HUD.
+      // ============================================================
+      window.LlmEngine = (function () {
+        let llmInference = null;
+        let isReady = false;
+        let isSupported = null;
+
+        const MODEL_URL =
+          'https://storage.googleapis.com/mediapipe-models/llm-inference/gemma-2b-it-gpu-int4/float16/1/gemma-2b-it-gpu-int4.bin';
+
+        async function checkSupport() {
+          if (isSupported !== null) return isSupported;
+          isSupported = !!navigator.gpu;
+          return isSupported;
+        }
+
+        async function init() {
+          const supported = await checkSupport();
+          if (!supported) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              action: 'LLM_UNAVAILABLE', reason: 'WebGPU not available in this WebView',
+            }));
+            return false;
+          }
+          try {
+            const genai = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-genai/genai_bundle.mjs');
+            const fileset = await genai.FilesetResolver.forGenAiTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-genai/wasm');
+            llmInference = await genai.LlmInference.createFromOptions(fileset, {
+              baseOptions: { modelAssetPath: MODEL_URL },
+              maxTokens: 64, topK: 40, temperature: 0.2, randomSeed: 1,
+            });
+            isReady = true;
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'LLM_READY' }));
+            return true;
+          } catch (err) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'LLM_UNAVAILABLE', reason: String(err) }));
+            return false;
+          }
+        }
+
+        async function evaluate(reason, faceCount) {
+          if (!isReady || !llmInference) return null;
+          const prompt =
+            'System: You are a concise security triage assistant for a laptop privacy tool.\\n' +
+            'Event: "' + reason + '". Faces currently in frame: ' + faceCount + '.\\n' +
+            'In one short sentence, state whether this looks like a genuine ' +
+            'shoulder-surfing risk or likely a false positive, and why.';
+          try {
+            const output = await llmInference.generateResponse(prompt);
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'LLM_VERDICT', verdict: output }));
+            return output;
+          } catch (err) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'LLM_ERROR', error: String(err) }));
+            return null;
+          }
+        }
+
+        return { init, evaluate, isReady: () => isReady };
+      })();
+
+      // ============================================================
+      // Vision / state engine
+      // ============================================================
+      const video = document.getElementById('webcam');
+      const canvas = document.getElementById('trackerCanvas');
+      const ctx = canvas.getContext('2d');
+
+      let currentStream = null;
+      let bootId = 0;
+      let isBooting = false;
+      let activeFacing = 'environment';
+
+      let isProcessing = false;
+      let activeSystemState = 'SAFE';
+
+      const LOCK_DWELL_MS = 650;
+      const RECOVER_DWELL_MS = 900;
+      let threatSince = null;
+      let clearSince = performance.now();
+
+      let trackedOperator = null;
+      let calibrationFramesLeft = 0;
+      const CALIBRATION_FRAMES = 15;
+      const OPERATOR_LOST_MS = 1500;
+
+      let trackedFaces = [];
+      const FACE_MATCH_RADIUS = 0.12;
+      const offscreenCanvas = document.createElement('canvas');
+      const offscreenCtx = offscreenCanvas.getContext('2d');
+
+      function resetTrackingState() {
+        activeSystemState = 'SAFE';
+        threatSince = null;
+        clearSince = performance.now();
+        trackedOperator = null;
+        calibrationFramesLeft = CALIBRATION_FRAMES;
+        trackedFaces = [];
+      }
+
+      let coverT = { scale: 1, offsetX: 0, offsetY: 0, videoW: 0, videoH: 0 };
+
+      function recomputeCoverTransform() {
+        const stageW = canvas.clientWidth;
+        const stageH = canvas.clientHeight;
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = stageW * dpr;
+        canvas.height = stageH * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const vw = video.videoWidth || 1280;
+        const vh = video.videoHeight || 720;
+        const scale = Math.max(stageW / vw, stageH / vh);
+        coverT = { scale, offsetX: (stageW - vw * scale) / 2, offsetY: (stageH - vh * scale) / 2, videoW: vw, videoH: vh };
+      }
+      window.addEventListener('resize', recomputeCoverTransform);
+
+      function toCanvasPoint(nx, ny) {
+        return {
+          x: coverT.offsetX + nx * coverT.videoW * coverT.scale,
+          y: coverT.offsetY + ny * coverT.videoH * coverT.scale,
+        };
+      }
+
+      // ---- FaceMesh landmark indices we actually use ----
+      const L_CHEEK = 234, R_CHEEK = 454;
+      const NOSE_TIP = 1;
+      const LEFT_IRIS = 468, RIGHT_IRIS = 473; // needs refineLandmarks:true
+      const LEFT_EYE_OUTER = 33, LEFT_EYE_INNER = 133;
+
+      // Builds a normalized bbox + center from the full mesh, since FaceMesh
+      // doesn't hand you a bbox directly like FaceDetection did.
+      function meshToFace(landmarks) {
+        let minX = 1, maxX = 0, minY = 1, maxY = 0;
+        for (const p of landmarks) {
+          if (p.x < minX) minX = p.x;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.y > maxY) maxY = p.y;
+        }
+        return {
+          landmarks,
+          cx: (minX + maxX) / 2,
+          cy: (minY + maxY) / 2,
+          width: maxX - minX,
+          height: maxY - minY,
+        };
+      }
+
+      // FIX: real gaze estimate, not a 6-point guess. Uses head-yaw from the
+      // stable cheek-to-nose ratio (robust even when blurry/distant/hooded,
+      // because it's derived from the whole mesh fit, not sparse points),
+      // then refines with iris position when eyes are actually visible.
+      // Returns { facingScreen: bool, confidence: 'high'|'low' } -- NEVER null.
+      // FAIL-SAFE: if we genuinely can't tell, facingScreen defaults to TRUE
+      // for anyone who isn't the operator. An unreadable bystander is a
+      // risk, not a free pass.
+function estimateGaze(landmarks) {
+        const lCheek = landmarks[L_CHEEK], rCheek = landmarks[R_CHEEK];
+        const nose = landmarks[NOSE_TIP];
+        if (!lCheek || !rCheek || !nose) {
+          return { facingScreen: true, confidence: 'low' };
+        }
+
+        const faceWidth = Math.abs(rCheek.x - lCheek.x);
+        if (faceWidth < 0.005) {
+          return { facingScreen: true, confidence: 'low' };
+        }
+        const midX = (lCheek.x + rCheek.x) / 2;
+        const yawRatio = Math.abs(nose.x - midX) / faceWidth;
+
+        // Increased from 0.28 to 0.45: Even a slight quarter-turn towards laptop triggers detection
+        if (yawRatio > 0.45) {
+          return { facingScreen: false, confidence: 'high' };
+        }
+
+        return { facingScreen: true, confidence: 'high' };
+      }
+
+      function extractFaceCrop(face) {
+        const padding = 0.35;
+        const x = Math.max(0, (face.cx - face.width / 2 - face.width * padding) * video.videoWidth);
+        const y = Math.max(0, (face.cy - face.height / 2 - face.height * padding) * video.videoHeight);
+        const w = Math.min(video.videoWidth - x, face.width * (1 + padding * 2) * video.videoWidth);
+        const h = Math.min(video.videoHeight - y, face.height * (1 + padding * 2) * video.videoHeight);
+        offscreenCanvas.width = w; offscreenCanvas.height = h;
+        offscreenCtx.drawImage(video, x, y, w, h, 0, 0, w, h);
+        const frozen = document.createElement('canvas');
+        frozen.width = w; frozen.height = h;
+        frozen.getContext('2d').drawImage(offscreenCanvas, 0, 0);
+        return frozen;
+      }
+
+      function matchTrackedFace(f) {
+        let best = null, bestDist = FACE_MATCH_RADIUS;
+        for (const t of trackedFaces) {
+          const d = Math.hypot(f.cx - t.cx, f.cy - t.cy);
+          if (d < bestDist) { bestDist = d; best = t; }
+        }
+        return best;
+      }
+
+      function classifyFaces(faces) {
+        const now = performance.now();
+        const stillTracked = [];
+        for (const f of faces) {
+          let t = matchTrackedFace(f);
+          if (!t) t = { cx: f.cx, cy: f.cy, label: 'unknown', lastCheck: 0 };
+          else { t.cx = f.cx; t.cy = f.cy; }
+
+          const dueForCheck = now - t.lastCheck > window.IdentityEngine.IDENTITY_INTERVAL_MS;
+          if (dueForCheck && window.IdentityEngine.isModelsReady()) {
+            t.lastCheck = now;
+            const crop = extractFaceCrop(f);
+            window.IdentityEngine.identifyCrop(crop).then((label) => { if (label) t.label = label; });
+          }
+          f.identityLabel = t.label;
+          stillTracked.push(t);
+        }
+        trackedFaces = stillTracked;
+      }
+
+      const OPERATOR_SMOOTHING_ALPHA = 0.4; // EMA factor: higher = snappier, lower = steadier against jitter
+
+      function pickOperator(faces) {
+        if (!faces.length) return trackedOperator;
+        if (!trackedOperator || calibrationFramesLeft > 0) {
+          let best = faces[0], bestDist = Math.hypot(best.cx - 0.5, best.cy - 0.5);
+          for (const f of faces) {
+            const d = Math.hypot(f.cx - 0.5, f.cy - 0.5);
+            if (d < bestDist || (d === bestDist && f.width * f.height > best.width * best.height)) { best = f; bestDist = d; }
+          }
+          trackedOperator = { cx: best.cx, cy: best.cy, width: best.width, lastSeen: performance.now() };
+          calibrationFramesLeft = Math.max(0, calibrationFramesLeft - 1);
+          return trackedOperator;
+        }
+        let nearest = null, nearestDist = Infinity;
+        for (const f of faces) {
+          const d = Math.hypot(f.cx - trackedOperator.cx, f.cy - trackedOperator.cy);
+          if (d < nearestDist) { nearestDist = d; nearest = f; }
+        }
+        // FIX: radius scales with operator's own face size instead of a fixed
+        // value -- a close face naturally jitters more in normalized coords
+        // than a distant one, so a fixed radius was too tight for your own
+        // head movement and let you get misclassified as "not the operator."
+        const dynamicRadius = Math.max(0.10, trackedOperator.width * 0.7);
+        if (nearest && nearestDist < dynamicRadius) {
+          trackedOperator = {
+            cx: trackedOperator.cx + (nearest.cx - trackedOperator.cx) * OPERATOR_SMOOTHING_ALPHA,
+            cy: trackedOperator.cy + (nearest.cy - trackedOperator.cy) * OPERATOR_SMOOTHING_ALPHA,
+            width: nearest.width,
+            lastSeen: performance.now(),
+          };
+        } else if (performance.now() - trackedOperator.lastSeen > OPERATOR_LOST_MS) {
+          trackedOperator = null;
+          calibrationFramesLeft = CALIBRATION_FRAMES;
+        }
+        return trackedOperator;
+      }
+
+      function isOperatorFace(f, operator) {
+        if (!operator) return false;
+        const dynamicRadius = Math.max(0.10, operator.width * 0.7);
+        return Math.hypot(f.cx - operator.cx, f.cy - operator.cy) < dynamicRadius;
+      }
+
+      function drawFaceOutline(face, color) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        const tl = toCanvasPoint(face.cx - face.width / 2, face.cy - face.height / 2);
+        const w = face.width * coverT.videoW * coverT.scale;
+        const h = face.height * coverT.videoH * coverT.scale;
+        ctx.strokeRect(tl.x, tl.y, w, h);
+      }
+
+function onResults(results) {
+        ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+        const rawFaces = results.multiFaceLandmarks || [];
+        const faces = rawFaces.map(meshToFace);
+
+        let frameThreat = false;
+        let threatReason = '';
+
+        if (activeFacing === 'user') {
+          // FRONT CAMERA MODE (OPERATOR + OBSERVER)
+          if (faces.length > 1) {
+            // Sort by face area: Largest = Operator (Aap), Baaki = Shoulder Surfers
+            faces.sort((a, b) => (b.width * b.height) - (a.width * a.height));
+            
+            const operator = faces[0];
+            const bystanders = faces.slice(1);
+
+            for (const bystander of bystanders) {
+              const gaze = estimateGaze(bystander.landmarks);
+              // Agar bystander screen/phone ki taraf dekh raha hai (ya gaze doubtful hai):
+              if (gaze.facingScreen) {
+                frameThreat = true;
+                threatReason = 'Shoulder Surfer Detected (' + faces.length + ' Faces)';
+                break;
+              }
+            }
+
+            // Draw HUD: Operator = Cyan, Threat = Red
+            drawFaceOutline(operator, '#38BDF8');
+            for (const bystander of bystanders) {
+              drawFaceOutline(bystander, frameThreat ? '#EF4444' : '#38BDF8');
+            }
+          } else if (faces.length === 1) {
+            // Sirf 1 face hai (Aap) -> Guaranteed Safe
+            drawFaceOutline(faces[0], '#38BDF8');
+          }
+        } else {
+          // REAR CAMERA MODE (Phone facing outward/perimeter)
+          for (const f of faces) {
+            const gaze = estimateGaze(f.landmarks);
+            if (gaze.facingScreen) {
+              frameThreat = true;
+              threatReason = 'Perimeter Intruder (' + faces.length + ' Target)';
+            }
+          }
+          for (const f of faces) drawFaceOutline(f, frameThreat ? '#EF4444' : '#10B981');
+        }
+
+        const now = performance.now();
+        if (frameThreat) {
+          if (threatSince === null) threatSince = now;
+          clearSince = null;
+          // Trigger dwell reduced to 150ms for instant lockdown
+          if (activeSystemState !== 'LOCKDOWN' && (now - threatSince) >= 150) {
+            activeSystemState = 'LOCKDOWN';
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              action: 'STATE_CHANGE',
+              state: 'LOCKDOWN',
+              reason: threatReason
+            }));
+            if (window.LlmEngine && window.LlmEngine.isReady()) {
+              window.LlmEngine.evaluate(threatReason, faces.length);
+            }
+          }
+        } else {
+          if (clearSince === null) clearSince = now;
+          threatSince = null;
+          // Recovery dwell reduced to 300ms
+          if (activeSystemState !== 'SAFE' && (now - clearSince) >= 300) {
+            activeSystemState = 'SAFE';
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              action: 'STATE_CHANGE',
+              state: 'SAFE',
+              reason: activeFacing === 'user' ? 'Operator Verified (Perimeter Clear)' : 'Perimeter Secured (Clear)'
+            }));
+          }
+        }
+        isProcessing = false;
+      }
+
+      const faceMesh = new FaceMesh({
+        locateFile: (file) => 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/' + file
+      });
+      faceMesh.setOptions({
+        maxNumFaces: 4,
+        refineLandmarks: true, // needed for iris indices 468/473
+        // FIX: a hooded/backlit/distant bystander was failing to clear 0.5
+        // and never entering onResults() at all -- not a gaze bug, a
+        // detection bug. Recall matters more than precision here: a stray
+        // false detection is harmless (gaze math won't flag it), a missed
+        // one is a real hole.
+        minDetectionConfidence: 0.35,
+        minTrackingConfidence: 0.35,
+      });
+      faceMesh.onResults(onResults);
+
+      async function bootCamera(facing) {
+        const myBootId = ++bootId;
+        isBooting = true;
+        try {
+          if (currentStream) { currentStream.getTracks().forEach(t => t.stop()); currentStream = null; }
+          // FIX: 1280x720 instead of 640x480 -- a distant/hooded face needs
+          // more pixels on it for FaceMesh to lock on in the first place.
+          const constraints = { video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 },frameRate: { ideal: 30 } }, audio: false };
+          let stream;
+          try { stream = await navigator.mediaDevices.getUserMedia(constraints); }
+          catch (e) { stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false }); }
+          if (myBootId !== bootId) { stream.getTracks().forEach(t => t.stop()); return; }
+          currentStream = stream;
+          video.srcObject = stream;
+          video.onloadedmetadata = () => {
+            if (myBootId !== bootId) return;
+            video.play();
+            recomputeCoverTransform();
+            resetTrackingState();
+            window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'SWITCH_DONE' }));
+          };
+        } catch (err) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ action: 'CAMERA_ERROR', error: String(err) }));
+        } finally {
+          isBooting = false;
+        }
+      }
+
+      window.switchCameraLens = function (targetFacing) {
+        activeFacing = targetFacing;
+        bootCamera(targetFacing);
+      };
+
+      setInterval(async () => {
+        if (!isProcessing && !isBooting && video.readyState === 4) {
+          isProcessing = true;
+          await faceMesh.send({ image: video });
+        }
+      }, 50);
+
+      window.addEventListener('DOMContentLoaded', () => {
+        window.IdentityEngine.loadModels();
+        window.LlmEngine.init();
+      });
+    </script>
+  </body>
+  </html>
+`;
 
 export default function App() {
   const [status, setStatus] = useState<'SAFE' | 'LOCKDOWN'>('SAFE');
   const [reason, setReason] = useState('Perimeter Monitoring Active');
   const [interceptions, setInterceptions] = useState(0);
   const [connected, setConnected] = useState(false);
+  const [activeFacing, setActiveFacing] = useState<CameraMode>('environment');
+  const [isSwitching, setIsSwitching] = useState(false);
+  const [identityModelsReady, setIdentityModelsReady] = useState(false);
+  const [identityModelsFailed, setIdentityModelsFailed] = useState(false);
+  const [operatorEnrolled, setOperatorEnrolled] = useState(false);
 
   const ws = useRef<WebSocket | null>(null);
+  const webViewRef = useRef<any>(null);
   const currentStatusRef = useRef<'SAFE' | 'LOCKDOWN'>('SAFE');
+  const activeFacingRef = useRef<CameraMode>('environment'); // FIX: avoids stale-closure facing on load
 
-  // WebSocket lifecycle management
+  const sendSocketPayload = (event: 'BLUR' | 'RESTORE', alertReason: string) => {
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({ event, reason: alertReason, timestamp: Date.now() }));
+    }
+  };
+
+  const dispatchStateChange = useCallback((nextState: 'SAFE' | 'LOCKDOWN', alertReason: string) => {
+    if (currentStatusRef.current === nextState) return;
+    currentStatusRef.current = nextState;
+    setStatus(nextState);
+    setReason(alertReason);
+    if (nextState === 'LOCKDOWN') setInterceptions(prev => prev + 1);
+    sendSocketPayload(nextState === 'LOCKDOWN' ? 'BLUR' : 'RESTORE', alertReason);
+  }, []);
+
+  // FIX: heartbeat ping so the laptop side can detect a silently-dead
+  // connection (see server.py) instead of only reacting to a clean close.
   useEffect(() => {
     let reconnectTimer: ReturnType<typeof setTimeout>;
+    let heartbeatTimer: ReturnType<typeof setInterval>;
+
     const connect = () => {
       const socket = new WebSocket('ws://127.0.0.1:8000/ws');
       socket.onopen = () => {
         setConnected(true);
-        console.log('[Socket] Connected');
+        heartbeatTimer = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ event: 'PING', timestamp: Date.now() }));
+          }
+        }, 1000);
       };
       socket.onclose = () => {
         setConnected(false);
+        clearInterval(heartbeatTimer);
         reconnectTimer = setTimeout(connect, 2000);
       };
-      socket.onerror = () => {
-        setConnected(false);
-        socket.close();
-      };
+      socket.onerror = () => { setConnected(false); socket.close(); };
       ws.current = socket;
     };
 
     if (Platform.OS === 'android') {
-      PermissionsAndroid.requestMultiple([
-        PermissionsAndroid.PERMISSIONS.CAMERA,
-      ]);
+      PermissionsAndroid.requestMultiple([PermissionsAndroid.PERMISSIONS.CAMERA]);
     }
-
     connect();
+
+    const appStateSub = AppState.addEventListener('change', (nextState: AppStateStatus) => {
+      if (nextState.match(/inactive|background/)) {
+        dispatchStateChange('SAFE', 'App Minimized');
+        sendSocketPayload('RESTORE', 'App Minimized');
+      }
+    });
 
     return () => {
       clearTimeout(reconnectTimer);
-      if (ws.current) ws.current.close();
+      clearInterval(heartbeatTimer);
+      appStateSub.remove();
+      if (ws.current) {
+        sendSocketPayload('RESTORE', 'App Teardown');
+        ws.current.close();
+      }
     };
-  }, []);
+  }, [dispatchStateChange]);
 
-  // Thread-safe dispatch with state deduplication
-  const dispatchStateChange = useCallback(
-    (nextState: 'SAFE' | 'LOCKDOWN', alertReason: string) => {
-      if (currentStatusRef.current === nextState) return;
+  useEffect(() => { activeFacingRef.current = activeFacing; }, [activeFacing]);
 
-      currentStatusRef.current = nextState;
-      setStatus(nextState);
-      setReason(alertReason);
+  const switchCamera = (targetFacing: CameraMode) => {
+    if (isSwitching || targetFacing === activeFacing) return;
+    setIsSwitching(true);
+    setActiveFacing(targetFacing);
+    dispatchStateChange('SAFE', 'Camera Sensor Switching');
+    if (webViewRef.current) {
+      webViewRef.current.injectJavaScript(`
+        if (window.switchCameraLens) { window.switchCameraLens("${targetFacing}"); }
+        true;
+      `);
+    }
+  };
 
-      if (nextState === 'LOCKDOWN') {
-        setInterceptions(prev => prev + 1);
+  const retryIdentityModelLoad = () => {
+    setIdentityModelsFailed(false);
+    webViewRef.current?.injectJavaScript(`window.retryIdentityModelLoad(); true;`);
+  };
+
+  const enrollOperatorFace = () => {
+    launchCamera(
+      { mediaType: 'photo', includeBase64: true, cameraType: 'front', quality: 0.8, saveToPhotos: false },
+      (response) => {
+        if (response.didCancel || response.errorCode || !response.assets?.[0]?.base64) return;
+        const base64DataUrl = `data:image/jpeg;base64,${response.assets[0].base64}`;
+        webViewRef.current?.injectJavaScript(`
+          window.enrollOperatorFace(${JSON.stringify(base64DataUrl)});
+          true;
+        `);
       }
+    );
+  };
 
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        ws.current.send(
-          JSON.stringify({
-            event: nextState === 'LOCKDOWN' ? 'BLUR' : 'RESTORE',
-            reason: alertReason,
-            timestamp: Date.now(),
-          }),
-        );
-      }
-    },
-    [],
-  );
-
-  const pipelineEngineHtml = `
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-      <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body, html { width: 100%; height: 100%; background: #000; overflow: hidden; display: flex; align-items: center; justify-content: center; }
-        video { width: 100%; height: 100%; object-fit: cover; }
-        #canvas { display: none; }
-      </style>
-      <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-      <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js" crossorigin="anonymous"></script>
-    </head>
-    <body>
-      <video id="webcam" autoplay playsinline muted></video>
-      <script>
-        const video = document.getElementById('webcam');
-        let isProcessing = false;
-        let consecutivePositives = 0;
-        let consecutiveNegatives = 0;
-        let activeSystemState = 'SAFE';
-
-        // State Machine Thresholds (Prevents Sticking & Eliminates Noise)
-        const TRIGGER_HITS = 2;   // 2 continuous detected frames to trigger lockdown
-        const RECOVERY_HITS = 4;  // 4 clear frames to automatically restore safe state
-
-        function onResults(results) {
-          const detections = results.detections || [];
-
-          if (detections.length > 0) {
-            consecutivePositives++;
-            consecutiveNegatives = 0;
-
-            if (consecutivePositives >= TRIGGER_HITS && activeSystemState !== 'LOCKDOWN') {
-              activeSystemState = 'LOCKDOWN';
-              window.ReactNativeWebView.postMessage(JSON.stringify({
-                action: 'STATE_CHANGE',
-                state: 'LOCKDOWN',
-                reason: "Observer face detected (" + detections.length + " target)"
-              }));
-            }
-          } else {
-            consecutiveNegatives++;
-            consecutivePositives = 0;
-
-            if (consecutiveNegatives >= RECOVERY_HITS && activeSystemState !== 'SAFE') {
-              activeSystemState = 'SAFE';
-              window.ReactNativeWebView.postMessage(JSON.stringify({
-                action: 'STATE_CHANGE',
-                state: 'SAFE',
-                reason: 'Perimeter Secured (Clear)'
-              }));
-            }
-          }
-          isProcessing = false;
-        }
-
-        const detector = new FaceDetection({
-          locateFile: (file) => 'https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/' + file
-        });
-
-        detector.setOptions({
-          model: 'short',
-          minDetectionConfidence: 0.65
-        });
-        detector.onResults(onResults);
-
-        // Strict Rear Camera Acquisition Routine
-        async function bootCamera() {
-          try {
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const videoDevices = devices.filter(d => d.kind === 'videoinput');
-            
-            // Explicitly filter for back/rear environment camera
-            let targetDeviceId = null;
-            for (const d of videoDevices) {
-              const label = d.label.toLowerCase();
-              if (label.includes('back') || label.includes('rear') || label.includes('environment')) {
-                targetDeviceId = d.deviceId;
-                break;
-              }
-            }
-
-            const constraints = {
-              video: targetDeviceId 
-                ? { deviceId: { exact: targetDeviceId }, width: { ideal: 640 }, height: { ideal: 480 } }
-                : { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } },
-              audio: false
-            };
-
-            const stream = await navigator.mediaDevices.getUserMedia(constraints);
-            video.srcObject = stream;
-            video.onloadedmetadata = () => {
-              video.play();
-              runPipeline();
-            };
-          } catch (e) {
-            // Fallback to standard environment facing
-            const fallbackStream = await navigator.mediaDevices.getUserMedia({
-              video: { facingMode: "environment" },
-              audio: false
-            });
-            video.srcObject = fallbackStream;
-            video.play();
-            runPipeline();
-          }
-        }
-
-        function runPipeline() {
-          setInterval(async () => {
-            if (!isProcessing && video.readyState === 4) {
-              isProcessing = true;
-              await detector.send({ image: video });
-            }
-          }, 60); // 16 FPS non-blocking inference loop
-        }
-
-        window.addEventListener('DOMContentLoaded', bootCamera);
-      </script>
-    </body>
-    </html>
-  `;
+  // FIX: HTML is built exactly once and never depends on React state -- no
+  // more reload-on-switch race.
+  const pipelineEngineHtml = useMemo(() => PIPELINE_ENGINE_HTML, []);
 
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="light-content" />
       <View style={styles.container}>
         <View style={styles.cameraFrame}>
-          <WebView
+          <SafeWebView
+            ref={webViewRef}
             originWhitelist={['*']}
             source={{ html: pipelineEngineHtml, baseUrl: 'https://localhost' }}
             style={styles.webview}
@@ -217,14 +695,40 @@ export default function App() {
             javaScriptEnabled={true}
             domStorageEnabled={true}
             androidHardwareAccelerationDisabled={false}
-            onPermissionRequest={(event: any) => {
-              event.grant(event.resources);
+            onPermissionRequest={(event: any) => { event.grant(event.resources); }}
+            onLoadEnd={() => {
+              // FIX: the real starting facing is handed to the page exactly
+              // once here, instead of being templated into the HTML string.
+              webViewRef.current?.injectJavaScript(`
+                if (window.switchCameraLens) { window.switchCameraLens("${activeFacingRef.current}"); }
+                true;
+              `);
             }}
-            onMessage={event => {
+            onMessage={(event: any) => {
               try {
                 const payload = JSON.parse(event.nativeEvent.data);
                 if (payload.action === 'STATE_CHANGE') {
                   dispatchStateChange(payload.state, payload.reason);
+                } else if (payload.action === 'SWITCH_DONE') {
+                  setIsSwitching(false);
+                } else if (payload.action === 'CAMERA_ERROR') {
+                  setIsSwitching(false);
+                  console.error('[Camera Error]', payload.error);
+                } else if (payload.action === 'LLM_VERDICT') {
+                  console.log('[Gemma Verdict]', payload.verdict);
+                } else if (payload.action === 'LLM_UNAVAILABLE' || payload.action === 'LLM_ERROR') {
+                  console.warn('[LLM]', payload.reason || payload.error);
+                } else if (payload.action === 'IDENTITY_MODELS_READY') {
+                  setIdentityModelsReady(true);
+                  setIdentityModelsFailed(false);
+                } else if (payload.action === 'IDENTITY_MODELS_FAILED') {
+                  setIdentityModelsFailed(true);
+                  console.warn('[Identity]', payload.error);
+                } else if (payload.action === 'ENROLL_DONE') {
+                  setOperatorEnrolled(true);
+                } else if (payload.action === 'ENROLL_FAILED') {
+                  setOperatorEnrolled(false);
+                  console.warn('[Enroll Failed]', payload.error);
                 }
               } catch (e) {
                 console.error('[Bridge Frame Error]', e);
@@ -235,50 +739,66 @@ export default function App() {
           <View style={styles.hudOverlay} pointerEvents="none">
             <View style={styles.lensBadge}>
               <Text style={styles.lensBadgeText}>
-                EDGE PIPELINE: SNAPDRAGON ACCELERATED
+                {activeFacing === 'environment' ? 'SENSOR: REAR / DESK' : 'SENSOR: FRONT / DOCK'}
               </Text>
             </View>
-            <View
-              style={[
-                styles.reticle,
-                status === 'LOCKDOWN' ? styles.reticleRed : styles.reticleGreen,
-              ]}
-            />
+            <View style={[styles.reticle, status === 'LOCKDOWN' ? styles.reticleRed : styles.reticleGreen]} />
           </View>
         </View>
 
         <View style={styles.controlPanel}>
           <View style={styles.statusRow}>
             <Text style={styles.panelTitle}>STATUS: {status}</Text>
-            <Text style={styles.bridgeStatus}>
-              {connected ? '🟢 Port 8000 Sync' : '🔴 Socket Disconnected'}
-            </Text>
+            <Text style={styles.bridgeStatus}>{connected ? '🟢 Port 8000 Sync' : '🔴 Socket Disconnected'}</Text>
           </View>
-          <Text
+          <Text style={[styles.reasonText, status === 'LOCKDOWN' ? styles.threatAlert : null]}>{reason}</Text>
+
+          <View style={styles.selectorDeck}>
+            <TouchableOpacity
+              style={[styles.selectTab, activeFacing === 'environment' && styles.tabActive, isSwitching && styles.tabDisabled]}
+              onPress={() => switchCamera('environment')} disabled={isSwitching}>
+              <Text style={[styles.tabLabel, activeFacing === 'environment' && styles.labelActive]}>Rear Camera</Text>
+              <Text style={styles.tabSub}>Phone flat on desk</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.selectTab, activeFacing === 'user' && styles.tabActive, isSwitching && styles.tabDisabled]}
+              onPress={() => switchCamera('user')} disabled={isSwitching}>
+              <Text style={[styles.tabLabel, activeFacing === 'user' && styles.labelActive]}>Front Camera</Text>
+              <Text style={styles.tabSub}>Phone on vertical dock</Text>
+            </TouchableOpacity>
+          </View>
+
+          <TouchableOpacity
             style={[
-              styles.reasonText,
-              status === 'LOCKDOWN' ? styles.threatAlert : null,
+              styles.enrollButton,
+              operatorEnrolled && styles.enrollButtonDone,
+              identityModelsFailed && styles.enrollButtonFailed,
             ]}
-          >
-            {reason}
-          </Text>
+            onPress={identityModelsFailed ? retryIdentityModelLoad : enrollOperatorFace}
+            disabled={!identityModelsReady && !identityModelsFailed}>
+            <Text style={styles.enrollButtonText}>
+              {identityModelsFailed
+                ? '⚠ Face model failed — Tap to retry'
+                : !identityModelsReady
+                ? 'Loading face model…'
+                : operatorEnrolled
+                ? '✓ Face-Locked — Re-enroll'
+                : 'Enroll My Face (Selfie)'}
+            </Text>
+          </TouchableOpacity>
 
           <View style={styles.metricsBox}>
             <View style={styles.metricItem}>
               <Text style={styles.metricLabel}>VISION ENGINE</Text>
-              <Text style={styles.metricValue}>
-                MediaPipe Tasks (NPU/WebGL)
-              </Text>
+              <Text style={styles.metricValue}>FaceMesh Eye-Gaze Geometry</Text>
             </View>
             <View style={styles.metricItem}>
               <Text style={styles.metricLabel}>INTERCEPTIONS</Text>
-              <Text style={styles.metricValue}>
-                {interceptions} Events Logged
-              </Text>
+              <Text style={styles.metricValue}>{interceptions} Events Logged</Text>
             </View>
             <View style={styles.metricItem}>
-              <Text style={styles.metricLabel}>LOOP LATENCY</Text>
-              <Text style={styles.metricValue}>~42 ms (Sub-second)</Text>
+              <Text style={styles.metricLabel}>STATE ENGINE</Text>
+              <Text style={styles.metricValue}>{isSwitching ? 'SYNCING SENSOR...' : 'REAL-TIME ACTIVE'}</Text>
             </View>
           </View>
         </View>
@@ -290,76 +810,42 @@ export default function App() {
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: '#020617' },
   container: { flex: 1, backgroundColor: '#020617' },
-  cameraFrame: { flex: 0.65, position: 'relative', overflow: 'hidden' },
+  cameraFrame: { flex: 0.60, position: 'relative', overflow: 'hidden' },
   webview: { flex: 1, backgroundColor: '#000' },
-  hudOverlay: {
-    ...StyleSheet.absoluteFill,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
+  hudOverlay: { ...StyleSheet.absoluteFill, justifyContent: 'center', alignItems: 'center' },
   lensBadge: {
-    position: 'absolute',
-    top: 50,
-    left: 16,
-    backgroundColor: 'rgba(2, 6, 23, 0.85)',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#38BDF8',
+    position: 'absolute', top: 50, left: 16, backgroundColor: 'rgba(2, 6, 23, 0.85)',
+    paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6, borderWidth: 1, borderColor: '#38BDF8',
   },
-  lensBadgeText: {
-    color: '#38BDF8',
-    fontSize: 11,
-    fontWeight: 'bold',
-    letterSpacing: 0.5,
-  },
-  reticle: {
-    width: 170,
-    height: 170,
-    borderWidth: 2,
-    borderRadius: 16,
-    borderStyle: 'dashed',
-  },
+  lensBadgeText: { color: '#38BDF8', fontSize: 11, fontWeight: 'bold', letterSpacing: 0.5 },
+  reticle: { width: 170, height: 170, borderWidth: 2, borderRadius: 16, borderStyle: 'dashed' },
   reticleGreen: { borderColor: '#10B981' },
   reticleRed: { borderColor: '#EF4444' },
   controlPanel: {
-    flex: 0.35,
-    backgroundColor: '#0B0F19',
-    padding: 18,
-    justifyContent: 'space-between',
-    borderTopWidth: 1,
-    borderTopColor: '#1E293B',
+    flex: 0.40, backgroundColor: '#0B0F19', padding: 16, justifyContent: 'space-between',
+    borderTopWidth: 1, borderTopColor: '#1E293B',
   },
-  statusRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  panelTitle: {
-    color: '#FFF',
-    fontSize: 18,
-    fontWeight: 'bold',
-    letterSpacing: 1,
-  },
+  statusRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  panelTitle: { color: '#FFF', fontSize: 18, fontWeight: 'bold', letterSpacing: 1 },
   bridgeStatus: { color: '#9CA3AF', fontSize: 12 },
   reasonText: { color: '#94A3B8', fontSize: 13, marginVertical: 4 },
   threatAlert: { color: '#EF4444', fontWeight: 'bold' },
-  metricsBox: {
-    backgroundColor: '#020617',
-    padding: 12,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#1E293B',
-    marginTop: 8,
-    gap: 6,
-  },
+  selectorDeck: { flexDirection: 'row', gap: 10, marginVertical: 4 },
+  selectTab: { flex: 1, backgroundColor: '#1E293B', padding: 10, borderRadius: 8, borderWidth: 1.5, borderColor: '#334155' },
+  tabActive: { borderColor: '#38BDF8', backgroundColor: '#0F172A' },
+  tabDisabled: { opacity: 0.4 },
+  tabLabel: { color: '#94A3B8', fontSize: 13, fontWeight: 'bold' },
+  labelActive: { color: '#38BDF8' },
+  tabSub: { color: '#64748B', fontSize: 10, marginTop: 2 },
+  metricsBox: { backgroundColor: '#020617', padding: 10, borderRadius: 8, borderWidth: 1, borderColor: '#1E293B', gap: 4 },
   metricItem: { flexDirection: 'row', justifyContent: 'space-between' },
   metricLabel: { color: '#64748B', fontSize: 11, fontFamily: 'monospace' },
-  metricValue: {
-    color: '#38BDF8',
-    fontSize: 11,
-    fontWeight: 'bold',
-    fontFamily: 'monospace',
+  metricValue: { color: '#38BDF8', fontSize: 11, fontWeight: 'bold', fontFamily: 'monospace' },
+  enrollButton: {
+    backgroundColor: '#1E293B', padding: 10, borderRadius: 8, borderWidth: 1.5,
+    borderColor: '#334155', alignItems: 'center', marginVertical: 4,
   },
+  enrollButtonDone: { borderColor: '#10B981', backgroundColor: '#0F172A' },
+  enrollButtonFailed: { borderColor: '#F59E0B', backgroundColor: '#1C1917' },
+  enrollButtonText: { color: '#94A3B8', fontSize: 13, fontWeight: 'bold' },
 });
