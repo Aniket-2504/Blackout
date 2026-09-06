@@ -1,10 +1,3 @@
-"""
-Shared message contract between the phone (WebSocket client) and the
-laptop bridge. Keeping these as named constants instead of raw strings
-scattered across hud.py/watchdog.py/server.py means a typo becomes an
-import error instead of a silent no-op at runtime.
-"""
-
 from typing import Optional
 from pydantic import BaseModel
 
@@ -14,19 +7,20 @@ EVENT_BLUR = "BLUR"
 EVENT_LOCKDOWN = "LOCKDOWN"
 EVENT_RESTORE = "RESTORE"
 EVENT_SAFE = "SAFE"
+EVENT_AWAY = "AWAY"  
 
 THREAT_EVENTS = {EVENT_BLUR, EVENT_LOCKDOWN}
 CLEAR_EVENTS = {EVENT_RESTORE, EVENT_SAFE}
+AWAY_EVENTS = {EVENT_AWAY}
 
 # ---- Heartbeat / watchdog tuning ----
 HEARTBEAT_TIMEOUT_SECONDS = 3.0
 WATCHDOG_POLL_INTERVAL_SECONDS = 0.5
+AUTO_LOCK_TIMEOUT_SECONDS =4.0
 
 
 class IncomingMessage(BaseModel):
-    """Validates whatever JSON arrives over the socket. Bad/missing
-    fields fail fast with a clear error instead of a KeyError three
-    frames deep in the HUD thread."""
+    """Validates whatever JSON arrives over the socket."""
     event: str
     reason: Optional[str] = "Secondary Observer Detected"
     timestamp: Optional[int] = None
