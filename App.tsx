@@ -14,6 +14,7 @@ import {
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { launchCamera } from 'react-native-image-picker';
+import KeepAwake from '@sayem314/react-native-keep-awake';
 
 const SafeWebView = WebView as any;
 const SafeStatusBar = StatusBar as any;
