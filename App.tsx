@@ -192,12 +192,13 @@ const PIPELINE_ENGINE_HTML = `
       let activeFacing = 'environment';
 
       let isProcessing = false;
-      let activeSystemState = 'SAFE';
+      let activeSystemState = 'SAFE'; // SAFE, LOCKDOWN, AWAY
 
       const LOCK_DWELL_MS = 650;
       const RECOVER_DWELL_MS = 900;
       let threatSince = null;
       let clearSince = performance.now();
+      let awaySince = null; // NEW: Timer for operator absence
 
       let trackedOperator = null;
       let calibrationFramesLeft = 0;
@@ -212,6 +213,7 @@ const PIPELINE_ENGINE_HTML = `
       function resetTrackingState() {
         activeSystemState = 'SAFE';
         threatSince = null;
+        awaySince = null;
         clearSince = performance.now();
         trackedOperator = null;
         calibrationFramesLeft = CALIBRATION_FRAMES;
@@ -389,10 +391,14 @@ const PIPELINE_ENGINE_HTML = `
         const faces = rawFaces.map(meshToFace);
 
         let frameThreat = false;
+        let frameAway = false;
         let threatReason = '';
 
         if (activeFacing === 'user') {
-          if (faces.length > 1) {
+          // If 0 faces detected, Operator has physically left
+          if (faces.length === 0) {
+            frameAway = true;
+          } else if (faces.length > 1) {
             faces.sort((a, b) => (b.width * b.height) - (a.width * a.height));
             const operator = faces[0];
             const bystanders = faces.slice(1);
@@ -414,6 +420,7 @@ const PIPELINE_ENGINE_HTML = `
             drawFaceOutline(faces[0], '#FACC15');
           }
         } else {
+          // Rear camera is unaffected by 'away' detection
           for (const f of faces) {
             const gaze = estimateGaze(f.landmarks);
             if (gaze.facingScreen) {
@@ -425,28 +432,38 @@ const PIPELINE_ENGINE_HTML = `
         }
 
         const now = performance.now();
+        
         if (frameThreat) {
           if (threatSince === null) threatSince = now;
           clearSince = null;
+          awaySince = null;
           if (activeSystemState !== 'LOCKDOWN' && (now - threatSince) >= 150) {
             activeSystemState = 'LOCKDOWN';
             window.ReactNativeWebView.postMessage(JSON.stringify({
-              action: 'STATE_CHANGE',
-              state: 'LOCKDOWN',
-              reason: threatReason
+              action: 'STATE_CHANGE', state: 'LOCKDOWN', reason: threatReason
             }));
             if (window.LlmEngine && window.LlmEngine.isReady()) {
               window.LlmEngine.evaluate(threatReason, faces.length);
             }
           }
+        } else if (frameAway) {
+          clearSince = null;
+          threatSince = null;
+          if (awaySince === null) awaySince = now;
+          if (activeSystemState !== 'AWAY' && (now - awaySince) >= 1500) {
+            activeSystemState = 'AWAY';
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              action: 'STATE_CHANGE', state: 'AWAY', reason: 'Operator Absent (Auto-Lock Timer Active)'
+            }));
+          }
         } else {
+          awaySince = null;
           if (clearSince === null) clearSince = now;
           threatSince = null;
           if (activeSystemState !== 'SAFE' && (now - clearSince) >= 300) {
             activeSystemState = 'SAFE';
             window.ReactNativeWebView.postMessage(JSON.stringify({
-              action: 'STATE_CHANGE',
-              state: 'SAFE',
+              action: 'STATE_CHANGE', state: 'SAFE',
               reason: activeFacing === 'user' ? 'Operator Verified (Perimeter Clear)' : 'Perimeter Secured (Clear)'
             }));
           }
@@ -513,7 +530,7 @@ const PIPELINE_ENGINE_HTML = `
 `;
 
 export default function App() {
-  const [status, setStatus] = useState<'SAFE' | 'LOCKDOWN'>('SAFE');
+  const [status, setStatus] = useState<'SAFE' | 'LOCKDOWN' | 'AWAY'>('SAFE');
   const [reason, setReason] = useState('Perimeter Monitoring Active');
   const [interceptions, setInterceptions] = useState(0);
   const [connected, setConnected] = useState(false);
@@ -525,22 +542,30 @@ export default function App() {
 
   const ws = useRef<WebSocket | null>(null);
   const webViewRef = useRef<any>(null);
-  const currentStatusRef = useRef<'SAFE' | 'LOCKDOWN'>('SAFE');
+  const currentStatusRef = useRef<'SAFE' | 'LOCKDOWN' | 'AWAY'>('SAFE');
   const activeFacingRef = useRef<CameraMode>('environment');
 
-  const sendSocketPayload = (event: 'BLUR' | 'RESTORE', alertReason: string) => {
+  const sendSocketPayload = (event: 'BLUR' | 'RESTORE' | 'AWAY', alertReason: string) => {
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
       ws.current.send(JSON.stringify({ event, reason: alertReason, timestamp: Date.now() }));
     }
   };
 
-  const dispatchStateChange = useCallback((nextState: 'SAFE' | 'LOCKDOWN', alertReason: string) => {
+  const dispatchStateChange = useCallback((nextState: 'SAFE' | 'LOCKDOWN' | 'AWAY', alertReason: string) => {
     if (currentStatusRef.current === nextState) return;
     currentStatusRef.current = nextState;
     setStatus(nextState);
     setReason(alertReason);
-    if (nextState === 'LOCKDOWN') setInterceptions(prev => prev + 1);
-    sendSocketPayload(nextState === 'LOCKDOWN' ? 'BLUR' : 'RESTORE', alertReason);
+    
+    let socketEvent = 'RESTORE';
+    if (nextState === 'LOCKDOWN') {
+        setInterceptions(prev => prev + 1);
+        socketEvent = 'BLUR';
+    } else if (nextState === 'AWAY') {
+        socketEvent = 'AWAY';
+    }
+    
+    sendSocketPayload(socketEvent as any, alertReason);
   }, []);
 
   useEffect(() => {
@@ -689,7 +714,7 @@ export default function App() {
                 {activeFacing === 'environment' ? 'DESK SENSOR (WIDE)' : 'OPERATOR SENSOR (DOCK)'}
               </Text>
             </View>
-            <View style={[styles.reticle, status === 'LOCKDOWN' ? styles.reticleRed : styles.reticleYellow]} />
+            <View style={[styles.reticle, status === 'LOCKDOWN' ? styles.reticleRed : (status === 'AWAY' ? styles.reticleAmber : styles.reticleYellow)]} />
           </View>
         </View>
 
@@ -699,8 +724,8 @@ export default function App() {
           <View style={styles.statusRow}>
             <View>
               <Text style={styles.statusSubTitle}>SYSTEM INTEGRITY</Text>
-              <Text style={[styles.statusTitle, status === 'LOCKDOWN' ? styles.threatText : styles.safeText]}>
-                {status === 'LOCKDOWN' ? '● THREAT ENGAGED' : '● PERIMETER SECURE'}
+              <Text style={[styles.statusTitle, status === 'LOCKDOWN' ? styles.threatText : (status === 'AWAY' ? styles.awayText : styles.safeText)]}>
+                {status === 'LOCKDOWN' ? '● THREAT ENGAGED' : (status === 'AWAY' ? '● DESK ABANDONED' : '● PERIMETER SECURE')}
               </Text>
             </View>
             <View style={[styles.pillBadge, connected ? styles.badgeConnected : styles.badgeDisconnected]}>
@@ -709,7 +734,7 @@ export default function App() {
             </View>
           </View>
 
-          <Text style={[styles.reasonText, status === 'LOCKDOWN' && styles.threatText]}>{reason}</Text>
+          <Text style={[styles.reasonText, status === 'LOCKDOWN' && styles.threatText, status === 'AWAY' && styles.awayText]}>{reason}</Text>
 
           {/* Rounded Camera Switcher */}
           <View style={styles.switchDeck}>
@@ -828,6 +853,7 @@ const styles = StyleSheet.create({
   },
   reticleYellow: { borderColor: '#FACC15' },
   reticleRed: { borderColor: '#EF4444' },
+  reticleAmber: { borderColor: '#F59E0B' },
   controlPanel: {
     flex: 0.45,
     backgroundColor: '#09090B',
@@ -843,6 +869,7 @@ const styles = StyleSheet.create({
   statusTitle: { fontSize: 19, fontWeight: '900', letterSpacing: 0.5, marginTop: 2 },
   safeText: { color: '#FACC15' },
   threatText: { color: '#EF4444' },
+  awayText: { color: '#F59E0B' },
   pillBadge: {
     flexDirection: 'row',
     alignItems: 'center',
